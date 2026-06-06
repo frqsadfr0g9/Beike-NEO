@@ -1,0 +1,359 @@
+import WidgetKit
+import SwiftUI
+
+struct ClassEntry: TimelineEntry {
+    let date: Date
+    let hasClass: Bool
+    let className: String
+    let timeRange: String
+    let location: String
+    let teacher: String
+}
+
+// MARK: - JSON Codable Models
+
+struct WidgetClassItem: Codable {
+    let day: Int
+    let period: Int
+    let weeks: [Int]
+    let className: String
+    let teacherName: String?
+    let locationName: String?
+    let periodName: String?
+}
+
+struct WidgetClassPeriod: Codable {
+    let majorId: Int
+    let minorId: Int
+    let minorStartTime: String
+    let minorEndTime: String
+}
+
+struct WidgetCalendarDay: Codable {
+    let year: Int
+    let month: Int
+    let day: Int
+    let weekday: Int
+    let weekIndex: Int
+}
+
+struct WidgetCurriculumData: Codable {
+    let hasData: Bool
+    let allClasses: [WidgetClassItem]?
+    let allPeriods: [WidgetClassPeriod]?
+    let calendarDays: [WidgetCalendarDay]?
+    let termSeason: Int?
+    let holidayMode: Bool?
+}
+
+// MARK: - Timeline Provider
+
+struct Provider: TimelineProvider {
+    private let appGroup = "group.com.lyme.beikeneo"
+    private let curriculumDataKey = "curriculum_full_data"
+
+    func placeholder(in context: Context) -> ClassEntry {
+        ClassEntry(
+            date: Date(),
+            hasClass: true,
+            className: "高等数学",
+            timeRange: "09:00 - 10:30",
+            location: "教学楼A101",
+            teacher: "张老师"
+        )
+    }
+
+    func getSnapshot(in context: Context, completion: @escaping (ClassEntry) -> Void) {
+        completion(placeholder(in: context))
+    }
+
+    func getTimeline(in context: Context, completion: @escaping (Timeline<ClassEntry>) -> Void) {
+        guard let curriculum = readCurriculumData(), curriculum.hasData else {
+            let entry = ClassEntry(date: Date(), hasClass: false,
+                className: "等待数据同步…", timeRange: "打开App后自动更新",
+                location: "", teacher: "")
+            let refresh = Calendar.current.date(byAdding: .minute, value: 15, to: Date())!
+            completion(Timeline(entries: [entry], policy: .after(refresh)))
+            return
+        }
+
+        if curriculum.holidayMode == true {
+            let entry = ClassEntry(date: Date(), hasClass: false,
+                className: "假期快乐，祝你天天开心～",
+                timeRange: "", location: "", teacher: "")
+            let midnight = Calendar.current.startOfDay(
+                for: Calendar.current.date(byAdding: .day, value: 1, to: Date())!
+            )
+            completion(Timeline(entries: [entry], policy: .after(midnight)))
+            return
+        }
+
+        let entries = generateTimelineEntries(from: curriculum)
+        let lastEntry = entries.last!
+        let midnight = Calendar.current.startOfDay(
+            for: Calendar.current.date(byAdding: .day, value: 1, to: Date())!
+        )
+        let policy: TimelineReloadPolicy = lastEntry.date >= midnight ? .after(midnight) : .atEnd
+        completion(Timeline(entries: entries, policy: policy))
+    }
+
+    // MARK: - Timeline generation
+
+    private func generateTimelineEntries(from data: WidgetCurriculumData) -> [ClassEntry] {
+        if data.holidayMode == true {
+            return [ClassEntry(date: Date(), hasClass: false,
+                className: "假期快乐，祝你天天开心～",
+                timeRange: "", location: "", teacher: "")]
+        }
+
+        let calendar = Calendar.current
+        let now = Date()
+        let todayStart = calendar.startOfDay(for: now)
+        let components = calendar.dateComponents([.year, .month, .day, .weekday], from: now)
+        let todayWeekday = ((components.weekday ?? 1) + 5) % 7 + 1  // Sun=1..Sat=7 → Mon=1..Sun=7
+
+        guard let allClasses = data.allClasses,
+              let allPeriods = data.allPeriods else {
+            return [ClassEntry(date: now, hasClass: false,
+                className: "数据不完整", timeRange: "请打开App刷新", location: "", teacher: "")]
+        }
+
+        // Find today's week index from calendar days
+        let isSummerTerm = (data.termSeason ?? 1) >= 3
+        guard let todayWeekIndex = data.calendarDays?.first(where: {
+            $0.year == components.year && $0.month == components.month && $0.day == components.day
+        })?.weekIndex else {
+            // No calendar data: for summer term, repeat Monday week 1 every day
+            let lookupWeekday = isSummerTerm ? 1 : todayWeekday
+            let entry = computeEntry(for: now, allClasses: allClasses,
+                                     allPeriods: allPeriods, todayWeekday: lookupWeekday,
+                                     todayWeekIndex: 1)
+            return [entry]
+        }
+
+        // For summer term with calendar data, override to Monday schedule
+        let lookupWeekday = isSummerTerm ? 1 : todayWeekday
+        let todayClasses = allClasses.filter {
+            $0.day == lookupWeekday && $0.weeks.contains(todayWeekIndex)
+        }
+
+        if todayClasses.isEmpty {
+            let isWeekend = todayWeekday >= 6
+            return [ClassEntry(date: now, hasClass: false,
+                className: isWeekend ? "周末愉快～" : "今日无课",
+                timeRange: isWeekend ? "" : "好好休息吧~", location: "", teacher: "")]
+        }
+
+        // Compute start/end Date for each class
+        struct TimedClass {
+            let item: WidgetClassItem
+            let start: Date
+            let end: Date
+        }
+
+        let timedClasses: [TimedClass] = todayClasses.compactMap { item in
+            guard let start = computeDate(for: item, periods: allPeriods,
+                                          on: todayStart, useEnd: false),
+                  let end = computeDate(for: item, periods: allPeriods,
+                                        on: todayStart, useEnd: true) else {
+                return nil
+            }
+            return TimedClass(item: item, start: start, end: end)
+        }.sorted { $0.start < $1.start }
+
+        if timedClasses.isEmpty {
+            return [ClassEntry(date: now, hasClass: false,
+                className: "今日无课", timeRange: "", location: "", teacher: "")]
+        }
+
+        var entries: [ClassEntry] = []
+
+        // Always include current state as the first entry
+        entries.append(computeEntry(for: now, allClasses: allClasses,
+            allPeriods: allPeriods, todayWeekday: lookupWeekday,
+            todayWeekIndex: todayWeekIndex))
+
+        // At each class start: show ongoing
+        for tc in timedClasses {
+            if now < tc.start {
+                let endStr = formatTime(tc.end)
+                entries.append(ClassEntry(date: tc.start, hasClass: true,
+                    className: tc.item.className,
+                    timeRange: "进行中 - \(endStr)",
+                    location: tc.item.locationName ?? "",
+                    teacher: tc.item.teacherName ?? ""))
+            }
+        }
+
+        // At each class end: show next upcoming or "done"
+        for (i, tc) in timedClasses.enumerated() {
+            if now < tc.end {
+                if i + 1 < timedClasses.count {
+                    let next = timedClasses[i + 1]
+                    let startStr = formatTime(next.start)
+                    let endStr = formatTime(next.end)
+                    entries.append(ClassEntry(date: tc.end, hasClass: true,
+                        className: next.item.className,
+                        timeRange: "\(startStr) - \(endStr)",
+                        location: next.item.locationName ?? "",
+                        teacher: next.item.teacherName ?? ""))
+                } else {
+                    entries.append(ClassEntry(date: tc.end, hasClass: false,
+                        className: "今日课毕", timeRange: "好好休息吧~",
+                        location: "", teacher: ""))
+                }
+            }
+        }
+
+        // Midnight refresh
+        let midnight = calendar.date(byAdding: .day, value: 1, to: todayStart)!
+        entries.append(ClassEntry(date: midnight, hasClass: false,
+            className: "", timeRange: "", location: "", teacher: ""))
+
+        // Deduplicate entries at same date, keeping the latest meaningful one
+        var seen: [TimeInterval: ClassEntry] = [:]
+        for entry in entries.sorted(by: { $0.date < $1.date }) {
+            seen[entry.date.timeIntervalSince1970] = entry
+        }
+        return seen.values.sorted { $0.date < $1.date }
+    }
+
+    // MARK: - Single entry computation (for current state)
+
+    private func computeEntry(for date: Date, allClasses: [WidgetClassItem],
+                              allPeriods: [WidgetClassPeriod], todayWeekday: Int,
+                              todayWeekIndex: Int) -> ClassEntry {
+        let calendar = Calendar.current
+        let todayStart = calendar.startOfDay(for: date)
+
+        let todayClasses = allClasses.filter {
+            $0.day == todayWeekday && $0.weeks.contains(todayWeekIndex)
+        }
+
+        if todayClasses.isEmpty {
+            let isWeekend = todayWeekday >= 6
+            return ClassEntry(date: date, hasClass: false,
+                className: isWeekend ? "周末愉快～" : "今日无课",
+                timeRange: isWeekend ? "" : "好好休息吧~", location: "", teacher: "")
+        }
+
+        struct TimedClass {
+            let item: WidgetClassItem
+            let start: Date
+            let end: Date
+        }
+
+        let timedClasses: [TimedClass] = todayClasses.compactMap { item in
+            guard let start = computeDate(for: item, periods: allPeriods,
+                                          on: todayStart, useEnd: false),
+                  let end = computeDate(for: item, periods: allPeriods,
+                                        on: todayStart, useEnd: true) else {
+                return nil
+            }
+            return TimedClass(item: item, start: start, end: end)
+        }.sorted { $0.start < $1.start }
+
+        if timedClasses.isEmpty {
+            return ClassEntry(date: date, hasClass: false,
+                className: "今日无课", timeRange: "", location: "", teacher: "")
+        }
+
+        // Find ongoing or upcoming
+        var currentClass: TimedClass?
+        var nextClass: TimedClass?
+
+        for tc in timedClasses {
+            if date >= tc.start && date < tc.end {
+                currentClass = tc
+            } else if date < tc.start, nextClass == nil {
+                nextClass = tc
+            }
+        }
+
+        if let ongoing = currentClass {
+            let endStr = formatTime(ongoing.end)
+            return ClassEntry(date: date, hasClass: true,
+                className: ongoing.item.className,
+                timeRange: "进行中 - \(endStr)",
+                location: ongoing.item.locationName ?? "",
+                teacher: ongoing.item.teacherName ?? "")
+        }
+
+        if let upcoming = nextClass {
+            let startStr = formatTime(upcoming.start)
+            let endStr = formatTime(upcoming.end)
+            return ClassEntry(date: date, hasClass: true,
+                className: upcoming.item.className,
+                timeRange: "\(startStr) - \(endStr)",
+                location: upcoming.item.locationName ?? "",
+                teacher: upcoming.item.teacherName ?? "")
+        }
+
+        return ClassEntry(date: date, hasClass: false,
+            className: "今日课毕", timeRange: "好好休息吧~",
+            location: "", teacher: "")
+    }
+
+    // MARK: - Helpers
+
+    private func computeDate(for item: WidgetClassItem, periods: [WidgetClassPeriod],
+                             on today: Date, useEnd: Bool) -> Date? {
+        let matching = periods.filter { $0.majorId == item.period }
+        guard !matching.isEmpty else { return nil }
+
+        let calendar = Calendar.current
+        let components = calendar.dateComponents([.year, .month, .day], from: today)
+
+        if useEnd {
+            guard let latest = matching.max(by: { $0.minorEndTime < $1.minorEndTime }),
+                  let (h, m) = parseTime(latest.minorEndTime) else { return nil }
+            return calendar.date(from: DateComponents(
+                year: components.year, month: components.month, day: components.day,
+                hour: h, minute: m))
+        } else {
+            guard let earliest = matching.min(by: { $0.minorStartTime < $1.minorStartTime }),
+                  let (h, m) = parseTime(earliest.minorStartTime) else { return nil }
+            return calendar.date(from: DateComponents(
+                year: components.year, month: components.month, day: components.day,
+                hour: h, minute: m))
+        }
+    }
+
+    private func parseTime(_ str: String) -> (Int, Int)? {
+        let parts = str.split(separator: ":")
+        guard parts.count == 2,
+              let hour = Int(parts[0]),
+              let minute = Int(parts[1]) else { return nil }
+        return (hour, minute)
+    }
+
+    private func formatTime(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f.string(from: date)
+    }
+
+    // MARK: - Data reading
+
+    private func readCurriculumData() -> WidgetCurriculumData? {
+        guard let json = readString(forKey: curriculumDataKey),
+              let data = json.data(using: .utf8) else { return nil }
+
+        let decoder = JSONDecoder()
+        return try? decoder.decode(WidgetCurriculumData.self, from: data)
+    }
+
+    private func readString(forKey key: String) -> String? {
+        if let defaults = UserDefaults(suiteName: appGroup),
+           let json = defaults.string(forKey: key) {
+            return json
+        }
+        if let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: appGroup
+        ) {
+            let fileURL = containerURL.appendingPathComponent("\(key).json")
+            return try? String(contentsOf: fileURL, encoding: .utf8)
+        }
+        return nil
+    }
+}
